@@ -229,14 +229,15 @@ _builtins.print = _cprint
 import os
 import subprocess
 import sys
+from pathlib import Path
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-LAB = os.path.join(HERE, "lab")
+HERE = Path(__file__).resolve().parent
+LAB = HERE / "lab"
 
 
 def main() -> int:
     os.chdir(LAB)
-    return subprocess.call(["bash", os.path.join(LAB, "run.sh"), *sys.argv[1:]])
+    return subprocess.call(["bash", str(LAB / "run.sh"), *sys.argv[1:]])
 
 
 if __name__ == "__main__":

@@ -69,6 +69,37 @@ other_gitlab_running() {
     | grep -v "^${COMPOSE_PROJECT_NAME}-" | grep -q .
 }
 
+wait_gitlab_sign_in() {
+  local attempt="$1"
+  local i code down_streak=0
+  ready=0
+  echo "== wait GitLab sign_in attempt=${attempt} =="
+  for i in $(seq 1 150); do
+    if gitlab_up; then
+      down_streak=0
+    else
+      down_streak=$((down_streak + 1))
+      echo "gitlab-not-running attempt=${attempt} wait=${i} streak=${down_streak}"
+      docker compose -p "${COMPOSE_PROJECT_NAME}" ps || true
+      docker compose -p "${COMPOSE_PROJECT_NAME}" logs --tail=40 gitlab || true
+      if [[ "${down_streak}" -ge 4 ]]; then
+        echo "gitlab-oom-or-exit attempt=${attempt} wait=${i}"
+        break
+      fi
+    fi
+    code=$(curl -sS -o /tmp/gitlab-gitea-import-sign_in.html -w '%{http_code}' --max-time 8 \
+      "${GITLAB_URL}/users/sign_in" || true)
+    if [[ "${code}" == "200" ]]; then
+      ready=1
+      echo "gitlab-ready attempt=${attempt} wait=${i} http=${code}"
+      return 0
+    fi
+    echo "gitlab-wait attempt=${attempt} wait=${i} http=${code}"
+    sleep 8
+  done
+  return 1
+}
+
 echo "== docker compose down (clean) =="
 down
 gen_certs
@@ -101,33 +132,7 @@ for attempt in $(seq 1 25); do
     continue
   fi
 
-  echo "== wait GitLab sign_in attempt=${attempt} =="
-  ready=0
-  down_streak=0
-  for i in $(seq 1 150); do
-    if gitlab_up; then
-      down_streak=0
-    else
-      down_streak=$((down_streak + 1))
-      echo "gitlab-not-running attempt=${attempt} wait=${i} streak=${down_streak}"
-      docker compose -p "${COMPOSE_PROJECT_NAME}" ps || true
-      docker compose -p "${COMPOSE_PROJECT_NAME}" logs --tail=40 gitlab || true
-      if [[ "${down_streak}" -ge 4 ]]; then
-        echo "gitlab-oom-or-exit attempt=${attempt} wait=${i}"
-        break
-      fi
-    fi
-    code=$(curl -sS -o /tmp/gitlab-gitea-import-sign_in.html -w '%{http_code}' --max-time 8 \
-      "${GITLAB_URL}/users/sign_in" || true)
-    if [[ "${code}" == "200" ]]; then
-      ready=1
-      echo "gitlab-ready attempt=${attempt} wait=${i} http=${code}"
-      break
-    fi
-    echo "gitlab-wait attempt=${attempt} wait=${i} http=${code}"
-    sleep 8
-  done
-  if [[ "${ready}" == 1 ]]; then
+  if wait_gitlab_sign_in "${attempt}"; then
     break
   fi
   echo "gitlab-not-ready-retry attempt=${attempt}"

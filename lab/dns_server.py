@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """TTL-0 DNS rebind for gitea.lab. Other names are forwarded."""
 
+from __future__ import annotations
 
 import json
 import os
@@ -8,7 +9,9 @@ import socket
 import struct
 import threading
 import time
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 GITEA_NAME = os.environ.get("GITEA_NAME", "gitea.lab").strip(".").lower()
 PUBLIC_A = os.environ.get("PUBLIC_A", "1.1.1.1")
@@ -18,19 +21,15 @@ DNS_BIND = os.environ.get("DNS_BIND", "0.0.0.0")
 DNS_PORT = int(os.environ.get("DNS_PORT", "53"))
 CONTROL_BIND = os.environ.get("CONTROL_BIND", "0.0.0.0")
 CONTROL_PORT = int(os.environ.get("CONTROL_PORT", "8080"))
-READY_PATH = "/tmp/dns-ready"
+READY_PATH = Path("/tmp/dns-ready")
 
 QTYPE_A = 1
 QTYPE_AAAA = 28
 QTYPE_NS = 2
 QCLASS_IN = 1
-
-_lock = threading.Lock()
-_state = {
-    "mode": os.environ.get("REBIND_MODE", "pairs"),
-    "a_lookups": 0,
-    "events": [],
-}
+MAX_EVENTS = 200
+STATS_EVENTS = 40
+MODES = ("first2_then_loopback", "pairs", "public", "loopback")
 
 
 def log(msg: str) -> None:
@@ -88,38 +87,74 @@ def is_gitea(name: str) -> bool:
     return n == GITEA_NAME or n.startswith(GITEA_NAME + ".")
 
 
-def pick_a() -> str:
-    mode = _state["mode"]
-    n = _state["a_lookups"]
-    if mode == "public":
-        return PUBLIC_A
-    if mode == "loopback":
-        return LOOPBACK_A
-    if mode == "pairs":
+@dataclass
+class DnsState:
+    mode: str
+    a_lookups: int = 0
+    events: list[dict[str, object]] = field(default_factory=list)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def pick_a(self) -> str:
+        mode = self.mode
+        n = self.a_lookups
+        if mode == "public":
+            return PUBLIC_A
+        if mode == "loopback":
+            return LOOPBACK_A
+        if mode == "pairs":
+            if n <= 2:
+                return PUBLIC_A
+            return LOOPBACK_A if (n % 2 == 1) else PUBLIC_A
         if n <= 2:
             return PUBLIC_A
-        return LOOPBACK_A if (n % 2 == 1) else PUBLIC_A
-    if n <= 2:
-        return PUBLIC_A
-    return LOOPBACK_A
+        return LOOPBACK_A
+
+    def record_a(self, name: str) -> str:
+        with self._lock:
+            self.a_lookups += 1
+            ip = self.pick_a()
+            event: dict[str, object] = {
+                "n": self.a_lookups,
+                "name": name,
+                "ip": ip,
+                "mode": self.mode,
+                "ts": time.time(),
+            }
+            self.events.append(event)
+            if len(self.events) > MAX_EVENTS:
+                self.events = self.events[-MAX_EVENTS:]
+        log(f"dns-a n={event['n']} name={name} ip={ip} mode={event['mode']}")
+        return ip
+
+    def reset(self) -> dict[str, object]:
+        with self._lock:
+            self.a_lookups = 0
+            self.events.append(
+                {"n": 0, "name": "reset", "ip": "", "mode": self.mode, "ts": time.time()}
+            )
+            mode = self.mode
+        log("dns-reset")
+        return {"ok": True, "mode": mode, "a_lookups": 0}
+
+    def set_mode(self, mode: str) -> dict[str, object] | None:
+        if mode not in MODES:
+            return None
+        with self._lock:
+            self.mode = mode
+            self.a_lookups = 0
+        log(f"dns-mode {mode}")
+        return {"ok": True, "mode": mode, "a_lookups": 0}
+
+    def stats(self) -> dict[str, object]:
+        with self._lock:
+            return {
+                "mode": self.mode,
+                "a_lookups": self.a_lookups,
+                "events": list(self.events[-STATS_EVENTS:]),
+            }
 
 
-def record_a(name: str) -> str:
-    with _lock:
-        _state["a_lookups"] += 1
-        ip = pick_a()
-        event = {
-            "n": _state["a_lookups"],
-            "name": name,
-            "ip": ip,
-            "mode": _state["mode"],
-            "ts": time.time(),
-        }
-        _state["events"].append(event)
-        if len(_state["events"]) > 200:
-            _state["events"] = _state["events"][-200:]
-    log(f"dns-a n={event['n']} name={name} ip={ip} mode={event['mode']}")
-    return ip
+STATE = DnsState(mode=os.environ.get("REBIND_MODE", "pairs"))
 
 
 def answer_a(qid: int, qname: str, ip: str) -> bytes:
@@ -138,23 +173,21 @@ def answer_empty(qid: int, qname: str, qtype: int, rcode: int = 0) -> bytes:
 
 
 def forward(query: bytes) -> bytes | None:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(2.0)
-    try:
-        sock.sendto(query, (FORWARD_DNS, 53))
-        data, _ = sock.recvfrom(4096)
-        return data
-    except OSError as exc:
-        log(f"dns-forward-fail {exc}")
-        return None
-    finally:
-        sock.close()
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.settimeout(2.0)
+        try:
+            sock.sendto(query, (FORWARD_DNS, 53))
+            data, _addr = sock.recvfrom(4096)
+            return data
+        except OSError as exc:
+            log(f"dns-forward-fail {exc}")
+            return None
 
 
 def handle_query(data: bytes) -> bytes | None:
     if len(data) < 12:
         return None
-    qid, flags, qdcount, *_rest = struct.unpack("!HHHHHH", data[:12])
+    qid, _flags, qdcount, *_rest = struct.unpack("!HHHHHH", data[:12])
     if qdcount < 1:
         return None
     try:
@@ -171,7 +204,7 @@ def handle_query(data: bytes) -> bytes | None:
 
     if is_gitea(qname):
         if qtype == QTYPE_A:
-            ip = record_a(qname)
+            ip = STATE.record_a(qname)
             return answer_a(qid, qname, ip)
         if qtype == QTYPE_AAAA:
             log(f"dns-aaaa name={qname} nodata")
@@ -186,31 +219,30 @@ def handle_query(data: bytes) -> bytes | None:
 
 
 def dns_loop() -> None:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind((DNS_BIND, DNS_PORT))
-    log(f"dns-listen {DNS_BIND}:{DNS_PORT} gitea={GITEA_NAME} mode={_state['mode']}")
-    with open(READY_PATH, "w", encoding="utf-8") as fh:
-        fh.write("ready\n")
-    while True:
-        try:
-            data, addr = sock.recvfrom(4096)
-        except OSError as exc:
-            log(f"dns-recv-fail {exc}")
-            time.sleep(0.2)
-            continue
-        try:
-            resp = handle_query(data)
-            if resp:
-                sock.sendto(resp, addr)
-        except Exception as exc:  # noqa: BLE001 — keep DNS up
-            log(f"dns-handle-fail {type(exc).__name__}: {exc}")
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((DNS_BIND, DNS_PORT))
+        log(f"dns-listen {DNS_BIND}:{DNS_PORT} gitea={GITEA_NAME} mode={STATE.mode}")
+        READY_PATH.write_text("ready\n", encoding="utf-8")
+        while True:
+            try:
+                data, addr = sock.recvfrom(4096)
+            except OSError as exc:
+                log(f"dns-recv-fail {exc}")
+                time.sleep(0.2)
+                continue
+            try:
+                resp = handle_query(data)
+                if resp:
+                    sock.sendto(resp, addr)
+            except Exception as exc:  # noqa: BLE001 - keep DNS up
+                log(f"dns-handle-fail {type(exc).__name__}: {exc}")
 
 
 class ControlHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
-    def _send(self, code: int, payload: dict) -> None:
+    def _send(self, code: int, payload: dict[str, object]) -> None:
         body = json.dumps(payload).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
@@ -221,35 +253,22 @@ class ControlHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if self.path.startswith("/stats"):
-            with _lock:
-                payload = {
-                    "mode": _state["mode"],
-                    "a_lookups": _state["a_lookups"],
-                    "events": list(_state["events"][-40:]),
-                }
-            self._send(200, payload)
+            self._send(200, STATE.stats())
             return
         self._send(404, {"error": "not found"})
 
     def do_POST(self) -> None:
         path = self.path.split("?", 1)[0].rstrip("/")
         if path == "/reset":
-            with _lock:
-                _state["a_lookups"] = 0
-                _state["events"].append({"n": 0, "name": "reset", "ip": "", "mode": _state["mode"], "ts": time.time()})
-            log("dns-reset")
-            self._send(200, {"ok": True, "mode": _state["mode"], "a_lookups": 0})
+            self._send(200, STATE.reset())
             return
         if path.startswith("/mode/"):
             mode = path.split("/mode/", 1)[1].strip()
-            if mode not in ("first2_then_loopback", "pairs", "public", "loopback"):
+            payload = STATE.set_mode(mode)
+            if payload is None:
                 self._send(400, {"error": "bad mode"})
                 return
-            with _lock:
-                _state["mode"] = mode
-                _state["a_lookups"] = 0
-            log(f"dns-mode {mode}")
-            self._send(200, {"ok": True, "mode": mode, "a_lookups": 0})
+            self._send(200, payload)
             return
         self._send(404, {"error": "not found"})
 
@@ -260,7 +279,10 @@ class ControlHandler(BaseHTTPRequestHandler):
 def control_loop() -> None:
     httpd = ThreadingHTTPServer((CONTROL_BIND, CONTROL_PORT), ControlHandler)
     log(f"dns-control {CONTROL_BIND}:{CONTROL_PORT}")
-    httpd.serve_forever()
+    try:
+        httpd.serve_forever()
+    finally:
+        httpd.server_close()
 
 
 def main() -> int:
