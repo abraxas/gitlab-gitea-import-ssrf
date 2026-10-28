@@ -13,6 +13,10 @@
   &nbsp;·&nbsp;
   <a href="https://github.com/abraxas/gitlab-gitea-import-ssrf">gitlab-gitea-import-ssrf</a>
 </p>
+<p align="center">
+  Write-up: <a href="https://abraxaslabs.tech/research/gitlab-gitea-import-ssrf"><strong>https://abraxaslabs.tech/research/gitlab-gitea-import-ssrf</strong></a>
+</p>
+
 
 # gitlab-gitea-import-ssrf
 
